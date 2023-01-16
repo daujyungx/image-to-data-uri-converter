@@ -47,7 +47,7 @@ internal static class Program
         convertCommand.AddCommand(htmlCommand);
         Command imageCommand = new("image", "convert image.");
         Option<string> imageInputOption = new("--input", "input image file path or url.") { IsRequired = true, };
-        imageInputOption.AddAlias("-o");
+        imageInputOption.AddAlias("-i");
         imageCommand.AddOption(imageInputOption);
         imageCommand.SetHandler(async (context) =>
         {
