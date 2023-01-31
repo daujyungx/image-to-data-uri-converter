@@ -1,6 +1,10 @@
-﻿using AngleSharp.Common;
+﻿using AngleSharp;
+using AngleSharp.Common;
+using AngleSharp.Css;
 using AngleSharp.Dom;
-using AngleSharp.Html.Parser;
+using AngleSharp.Io;
+using AngleSharp.Io.Network;
+using AngleSharp.Js;
 using Microsoft.Extensions.Logging;
 using System;
 using System.IO;
@@ -20,28 +24,82 @@ public static class Converter
         return ToDataUri(bytes, extension);
     }
 
-    public static async Task<(string outputHtml, string title)> ConvertHtml(string htmlPath, ILogger logger, HttpClient httpClient, CancellationToken cancellationToken)
+    public static async Task<(string outputHtml, string title)> ConvertHtml(string htmlPath, bool enableJs, ILogger logger, HttpClient httpClient, CancellationToken cancellationToken)
     {
         var htmlUri = new Uri(htmlPath);
 
-        (string content, bool isLocal) = await GetContent(htmlUri, httpClient, cancellationToken);
+        bool isLocal = htmlUri.IsFile;
 
-        var parser = new HtmlParser();
-        var document = await parser.ParseDocumentAsync(content);
+        //var requester = new HttpClientRequester(httpClient);
+        var config = enableJs
+            ? Configuration.Default
+            .WithRenderDevice(new DefaultRenderDevice { ViewPortHeight = 1920, ViewPortWidth = 1080, DeviceHeight = 1920, DeviceWidth = 1080, })
+            .WithRequester(new HttpClientRequester(httpClient))
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true, })
+            .WithJs()
+            .WithCss()
+            : Configuration.Default
+            .WithRequester(new HttpClientRequester(httpClient))
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true, })
+            ;
 
-        var title = string.Join('_',
-            new[]
+        var context = BrowsingContext.New(config);
+
+        var document = await context.OpenAsync(new Url(htmlUri.ToString()), cancellationToken);
+
+        var title = new[]
             {
                 document.QuerySelector("head > title")?.TextContent?.Trim(),
                 document.QuerySelector("head > meta[property=\"og:title\"]")?.GetAttribute("content")?.Trim(),
-                Path.GetFileNameWithoutExtension(htmlUri.LocalPath).Trim(),
+                Path.GetFileNameWithoutExtension(htmlUri.LocalPath)?.Trim(),
             }
-            .FirstOrDefault(x => !string.IsNullOrEmpty(x))
-            ?.Split(Path.GetInvalidFileNameChars()) ?? Array.Empty<string>());
+            .FirstOrDefault(x => !string.IsNullOrEmpty(x));
 
-        var elements = document.QuerySelectorAll("img")
+        if (!string.IsNullOrEmpty(title) && string.IsNullOrWhiteSpace(document.QuerySelector("head > title")?.TextContent))
+        {
+            IElement titleElement;
+
+            if (document.QuerySelector("head > title") is IElement titleElementCurrent)
+            {
+                titleElement = titleElementCurrent;
+            }
+            else
+            {
+                titleElement = document.CreateElement("title");
+
+                IElement headElement;
+                if (document.QuerySelector("head") is IElement headElementCurrent)
+                {
+                    headElement = headElementCurrent;
+                }
+                else
+                {
+                    var headElementNew = document.CreateElement("head");
+                    document.DocumentElement.Prepend(headElementNew);
+                    headElement = headElementNew;
+                }
+                headElement.Prepend(titleElement);
+            }
+
+            titleElement.TextContent = title;
+        }
+
+        var elements = document.QuerySelectorAll("img, embed")
             .Select(element =>
             {
+                if (enableJs)
+                {
+                    var scriptCode = $"document.querySelector('{element.GetSelector()}').scrollIntoView()";
+                    try
+                    {
+                        document.ExecuteScript(scriptCode);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogInformation(ex, "failed to execute script. script: {scriptCode}", scriptCode);
+                    }
+                }
+
                 var src = element.GetAttribute("src")?.Trim();
                 var dataSrc = element.GetAttribute("data-src")?.Trim();
                 return (element, src: (!string.IsNullOrWhiteSpace(src) ? src : dataSrc) ?? @"");
@@ -62,16 +120,18 @@ public static class Converter
                 {
                     bytes = await GetBytes(srcUri, httpClient, cancellationToken);
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    logger.LogInformation(ex, "failed to get content. src: {src}", src);
                     return (src, dataUri: src);
                 }
 
                 var extension = Path.GetExtension(srcUri.LocalPath);
                 var mediaType = GetMediaType(extension, bytes);
 
-                if (mediaType == @"")
+                if (string.IsNullOrEmpty(mediaType))
                 {
+                    logger.LogInformation("not supported media type. src: {src}", src);
                     return (src, dataUri: src);
                 }
 
@@ -88,11 +148,12 @@ public static class Converter
 
         if (!isLocal)
         {
-            (document.DocumentElement.FirstElementChild ?? document.DocumentElement)
-                .Insert(AdjacentPosition.AfterBegin, $"<!-- OriginalSrc: {htmlUri} -->");
+            //(document.DocumentElement.FirstElementChild ?? document.DocumentElement)
+            //    .Insert(AdjacentPosition.AfterBegin, $"<!-- OriginalSrc: {htmlUri} -->");
+            document.DocumentElement.Prepend(document.CreateComment($" OriginalSrc: {htmlUri} "));
         }
 
-        return (document.DocumentElement.OuterHtml, title);
+        return (document.DocumentElement.OuterHtml, string.Join('_', title?.Split(Path.GetInvalidFileNameChars()) ?? Array.Empty<string>()));
     }
 
     internal static async Task<byte[]> GetBytes(Uri uri, HttpClient httpClient, CancellationToken cancellationToken)
@@ -107,15 +168,15 @@ public static class Converter
         }
     }
 
-    internal static async Task<(string content, bool isLocal)> GetContent(Uri uri, HttpClient httpClient, CancellationToken cancellationToken)
+    internal static async Task<string> GetContent(Uri uri, HttpClient httpClient, CancellationToken cancellationToken)
     {
         if (uri.IsFile)
         {
-            return (await File.ReadAllTextAsync(uri.LocalPath, cancellationToken), true);
+            return await File.ReadAllTextAsync(uri.LocalPath, cancellationToken);
         }
         else
         {
-            return (await httpClient.GetStringAsync(uri, cancellationToken), false);
+            return await httpClient.GetStringAsync(uri, cancellationToken);
         }
     }
 
